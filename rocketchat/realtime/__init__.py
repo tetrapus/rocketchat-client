@@ -12,22 +12,20 @@ class Client(WebSocketClient):
     def __init__(self, domain):
         super().__init__(
             "ws://{}/websocket".format(domain),
-            protocols=['http-only', 'chat']))
+            protocols=['http-only', 'chat'])
         self.callbacks = defaultdict(list)
         self.handlers = defaultdict(list)
+        self.handlers['connected'].append(self.on_connected)
+        self.handlers['ping'].append(self.on_ping)
 
     def opened(self):
-        self.send({
-            "msg": "connect",
-            "version": "1",
-            "support": ["1"]
-        })
+        self.send(msg='connect', version='1', support=['1'])
 
     def received_message(self, msg):
         msg = json.loads(str(msg))
 
         for handler in self.handlers[msg.get('msg')]:
-            handler(message)
+            handler(msg)
 
         for callback in self.callbacks[msg.get('id')]:
             callback(msg)
@@ -52,10 +50,13 @@ class Client(WebSocketClient):
     def send(self, **args):
         return super().send(json.dumps(args))
 
+    def closed(self, code, reason=None):
+        pass
+
     def call(self, method, *params, callback=None, **args):
         args['msg'] = 'method'
         args['method'] = method
-        args['id'] = generate_id()
+        args['id'] = self.generate_id()
         args['params'] = params
         if callback is not None:
             self.callbacks.setdefault(args['id'], []).append(callback)
@@ -63,7 +64,7 @@ class Client(WebSocketClient):
 
     def subscribe(self, name, *params):
         return self.send(
-            id=generate_id(),
+            id=self.generate_id(),
             msg='sub',
             name=name,
             params=params
