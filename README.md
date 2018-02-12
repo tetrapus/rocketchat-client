@@ -1,2 +1,2 @@
-# rocketchat-client
-API wrapper for Rocketchat's APIs
+# Rocketchat Client
+A python API wrapper for Rocketchat's APIs.
