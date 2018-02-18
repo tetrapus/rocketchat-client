@@ -92,7 +92,7 @@ class Client(WebSocketClient):
 
         handlers = self.handlers[event.msg]
         if 'collection' in event:
-            key = event.collection, event.fields.eventName
+            key = event.collection, event.fields.get('eventName')
             handlers = handlers + self.listeners[key]
 
         for handler in handlers:
