@@ -3,21 +3,35 @@ import json
 import uuid
 import sys
 
+import pprint
+
+from typing import DefaultDict, Callable, Optional, List, Union, Any, Tuple, Generator, Dict
 from collections import defaultdict, Iterable
 
 from ws4py.client.threadedclient import WebSocketClient
 
 
 class Message(dict):
+    """ Represents a message to/from the RocketChat server.
+
+    This is just a regular dictionary that allows you to address contents
+    as attributes.
+    """
     @classmethod
-    def decoder(cls, object):
+    def decoder(cls, object: dict):
+        ''' Constructor for `json.load`'s object hook'''
         return cls(**object)
 
-    def __getattr__(self, attr):
+    def __getattr__(self, attr: str):
+        ''' Allow contents access via attribute lookup.
+
+        Beware access via this method, as it is shadowed by dict operations
+        e.g `update`
+        '''
         return self[attr]
 
 
-def generate_id():
+def generate_id() -> str:
     """ Create a unique ID.
 
     This is passed in each message, and used to match requests
@@ -27,7 +41,8 @@ def generate_id():
 
 
 class Call(Message):
-    def __init__(self, method, *params, **args):
+    def __init__(self, method: str, *params, **args) -> None:
+        ''' Special constructor for a method call message '''
         super().__init__(
             **args,
             msg='method',
@@ -36,14 +51,24 @@ class Call(Message):
             params=params,
         )
 
+WaitingHandler = Generator[Message, Message, None]
+Handler = Callable[[Message], Optional[WaitingHandler]]
+Callback = Union[Callable[[Message], Any], WaitingHandler]
+
 
 class Client(WebSocketClient):
-    def __init__(self, domain):
+    def __init__(self, domain: str) -> None:
         super().__init__(
             "ws://{}/websocket".format(domain),
             protocols=['http-only', 'chat'])
-        self.callbacks = defaultdict(list)
-        self.handlers = defaultdict(list)
+        # Handlers are called when messages of a given type are received
+        self.handlers = defaultdict(list)  # type: DefaultDict[str, List[Handler]]
+        # Listeners are called when messages in a given collection are received
+        self.listeners = defaultdict(list)  # type: DefaultDict[Tuple[str, str], List[Handler]]
+
+        # Callbacks are called when messages with a given ID
+        # are received
+        self.callbacks = defaultdict(list)  # type: DefaultDict[str, List[Callback]]
 
         # Set default handlers
         self.handlers.update({
@@ -52,16 +77,24 @@ class Client(WebSocketClient):
         })
 
     # Websocket event handlers
-    def opened(self):
+    def opened(self) -> None:
         self.send(msg='connect', version='1', support=['1'])
 
-    def received_message(self, msg):
-        msg = json.loads(str(msg), object_hook=Message.decoder)
-        print(msg)
+    def received_message(self, data: str) -> None:
+        event = json.loads(str(data), object_hook=Message.decoder)
+        pprint.pprint(event)
 
-        for handler in self.handlers[msg.get('msg')]:
+        if 'msg' not in event:
+            return
+
+        handlers = self.handlers[event.msg]
+        if 'collection' in event:
+            key = event.collection, event.fields.eventName
+            handlers = handlers + self.listeners[key]
+
+        for handler in handlers:
             # Call the handler
-            result = handler(msg)
+            result = handler(event)
             # If this handler returns a generator, we try to run it.
             # Send the return value down the websocket and register the
             # generator as a handler for the response.
@@ -75,26 +108,26 @@ class Client(WebSocketClient):
             except StopIteration:
                 pass
 
-        for callback in self.callbacks[msg.get('id')]:
-            if hasattr(callback, 'send'):
+        for callback in self.callbacks[event.get('id')]:
+            if callable(callback):
+                callback(event)
+            else:
                 try:
-                    message = callback.send(msg)
+                    message = callback.send(event)
                     if 'id' in message:
                         self.callbacks[message['id']].append(callback)
                     self.send(**message)
                 except StopIteration:
                     pass
-            else:
-                callback(msg)
 
-    def closed(self, code, reason=None):
+    def closed(self, code: str, reason: str=None) -> None:
         pass
 
     # Default event handlers
-    def on_ping(self, msg):
+    def on_ping(self, msg: Message) -> None:
         self.send(msg="pong")
 
-    def on_connected(self, msg):
+    def on_connected(self, msg: Message) -> WaitingHandler:
         msg = yield Call('login', {
             "user": {"username": sys.argv[1]},
             "password": self._hash_password(sys.argv[2]),
@@ -104,35 +137,52 @@ class Client(WebSocketClient):
             print("{errorType}: {message}".format(**msg.error))
             self.close()
 
+        self.user_id = msg.result.id
+
         msg = yield Call('rooms/get', {'$date': 0})
+
+        self.subscribe(
+            'stream-notify-user',
+            self.user_id + '/rooms-changed',
+            self.on_join)
 
         rooms = msg.result['update']
         for room in rooms:
-            self.subscribe('stream-room-messages', room._id, False)
+            if room._id != 'o58ac5XBk6xLXXKST':
+                self.subscribe('stream-room-messages', room._id)
+
+    def on_join(self, message: Message) -> None:
+        event, room = message.fields.args
+        print (event)
+        if event == 'inserted':
+            self.subscribe('stream-room-messages', room._id)
 
     # Helpers for different types of messages
-    def send(self, **args):
-        print(args)
+    def send(self, **args) -> None:
+        pprint.pprint(args)
         return super().send(json.dumps(args))
 
-    def call(self, *args, callback=None, **kwargs):
-        args = Call(*args, **kwargs)
+    def call(self, *args, callback: Callback=None, **kwargs) -> None:
+        message = Call(*args, **kwargs)
 
         if callback is not None:
-            self.callbacks[args.id].append(callback)
+            self.callbacks[message.id].append(callback)
 
-        return self.send(**args)
+        return self.send(**message)
 
-    def subscribe(self, name, *params):
+    def subscribe(self, name: str, event: str, listener: Handler=None) -> None:
+        if listener:
+            self.listeners[name, event].append(listener)
+
         return self.send(
             id=generate_id(),
             msg='sub',
             name=name,
-            params=params
+            params=[event, False]
         )
 
     @staticmethod
-    def _hash_password(password):
+    def _hash_password(password: str) -> Dict[str, str]:
         """ The realtime API expects a hashed password """
         return {
             "digest": hashlib.sha256(password.encode('utf-8')).hexdigest(),
