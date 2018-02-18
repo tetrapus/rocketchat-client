@@ -7,6 +7,7 @@ import sys
 import uuid
 
 from collections import defaultdict, Iterable
+from functools import partial
 from typing import (
     Any,
     Callable,
@@ -86,9 +87,13 @@ class Client(WebSocketClient):
 
     user_id: str = None
 
-    def __init__(self, domain: str) -> None:
+    def __init__(
+            self,
+            domain: str,
+            username: str = None,
+            password: str = None) -> None:
         super().__init__(
-            "ws://{}/websocket".format(domain),
+            f'ws://{domain}/websocket',
             protocols=['http-only', 'chat'])
 
         self.handlers = defaultdict(list)
@@ -97,7 +102,13 @@ class Client(WebSocketClient):
 
         # Set default handlers
         self.handlers.update({
-            'connected': [self.on_connected],
+            'connected': [
+                partial(
+                    self.on_connected,
+                    username=username,
+                    password=password
+                )
+            ],
             'ping': [self.on_ping]
         })
 
@@ -153,11 +164,15 @@ class Client(WebSocketClient):
         ''' Replies to pings '''
         self.send_message(msg="pong")
 
-    def on_connected(self, msg: Message) -> WaitingHandler:
+    def on_connected(
+            self,
+            msg: Message,
+            username=None,
+            password=None) -> WaitingHandler:
         ''' Log in and subscribe to all joined rooms '''
         msg = yield Call('login', {
-            "user": {"username": sys.argv[1]},
-            "password": self._hash_password(sys.argv[2]),
+            "user": {"username": username},
+            "password": self._hash_password(password),
         })
 
         if 'error' in msg:
@@ -231,12 +246,3 @@ class Client(WebSocketClient):
             "digest": hashlib.sha256(password.encode('utf-8')).hexdigest(),
             "algorithm":"sha-256"
         }
-
-
-if __name__ == '__main__':
-    try:
-        ws = Client(sys.argv[3])
-        ws.connect()
-        ws.run_forever()
-    except KeyboardInterrupt:
-        ws.close()
