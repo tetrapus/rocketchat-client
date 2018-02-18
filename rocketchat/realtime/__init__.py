@@ -1,12 +1,21 @@
 import hashlib
 import json
-import uuid
-import sys
-
 import logging
+import sys
+import uuid
 
-from typing import DefaultDict, Callable, Optional, List, Union, Any, Tuple, Generator, Dict
 from collections import defaultdict, Iterable
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from ws4py.client.threadedclient import WebSocketClient
 

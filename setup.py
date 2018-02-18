@@ -29,8 +29,8 @@ setup(
 
     keywords='rocketchat api wrapper',
     packages=find_packages(),
-    install_requires=['ws4py'],
+    install_requires=['ws4py', 'requests'],
     extras_require={
-        'test': ['pytest', 'hypothesis'],
+        'test': ['pytest', 'hypothesis', 'mypy'],
     },
 )
