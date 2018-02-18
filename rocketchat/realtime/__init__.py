@@ -3,12 +3,15 @@ import json
 import uuid
 import sys
 
-import pprint
+import logging
 
 from typing import DefaultDict, Callable, Optional, List, Union, Any, Tuple, Generator, Dict
 from collections import defaultdict, Iterable
 
 from ws4py.client.threadedclient import WebSocketClient
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class Message(dict):
@@ -81,8 +84,8 @@ class Client(WebSocketClient):
         self.send(msg='connect', version='1', support=['1'])
 
     def received_message(self, data: str) -> None:
+        logger.info("Received: %s", data)
         event = json.loads(str(data), object_hook=Message.decoder)
-        pprint.pprint(event)
 
         if 'msg' not in event:
             return
@@ -134,7 +137,7 @@ class Client(WebSocketClient):
         })
 
         if 'error' in msg:
-            print("{errorType}: {message}".format(**msg.error))
+            logging.error("{errorType}: {message}".format(**msg.error))
             self.close()
 
         self.user_id = msg.result.id
@@ -153,14 +156,14 @@ class Client(WebSocketClient):
 
     def on_join(self, message: Message) -> None:
         event, room = message.fields.args
-        print (event)
         if event == 'inserted':
             self.subscribe('stream-room-messages', room._id)
 
     # Helpers for different types of messages
     def send(self, **args) -> None:
-        pprint.pprint(args)
-        return super().send(json.dumps(args))
+        data = json.dumps(args)
+        logging.info("Sending: %s", data)
+        return super().send(data)
 
     def call(self, *args, callback: Callback=None, **kwargs) -> None:
         message = Call(*args, **kwargs)
