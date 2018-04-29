@@ -7,4 +7,4 @@ install:
   - pip install -r requirements.txt
   - pip install -r tests/requirements.txt
 script:
-  - mypy rocketchat
+  - mypy rocketchat --ignore-missing-imports
