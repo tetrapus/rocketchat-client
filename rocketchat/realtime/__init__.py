@@ -1,13 +1,11 @@
 ''' RocketChat Realtime API. '''
 
-import inspect
 import hashlib
 import json
 import logging
 import uuid
 
 from abc import ABC, abstractmethod
-from functools import partial
 from typing import (
     Any,
     Callable,
@@ -26,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 class HandlerSignal:
+    '''
+    Sentinels handlers may return to signal various behaviours
+    '''
     pass
 
 
@@ -43,7 +44,7 @@ class Message(dict):
         ''' Constructor for `json.load`'s object hook'''
         return cls(**obj)
 
-    def __getattr__(self, attr: str):
+    def __getattr__(self, attr: str) -> Any:
         ''' Allow contents access via attribute lookup.
 
         Beware access via this method, as it is shadowed by dict operations
@@ -62,34 +63,40 @@ def generate_id() -> str:
 
 
 Handler = Callable[[Message], Optional[HandlerSignal]]
-Task = Generator['Runnable', Message, Optional[HandlerSignal]]
+Task = Generator['Runnable', Message, None]
 TaskFactory = Callable[[Message], Task]
 Listener = Union[Handler, TaskFactory]
 
 
-def handles(**kwargs: Any) -> Callable[[Listener], Listener]:
-    def decorator(funct: Listener) -> Listener:
-        try:
-            funct.handles.append(kwargs)
-        except AttributeError:
-            funct.handles = [kwargs]
+def get_handles(funct: Callable) -> List[Dict[str, Any]]:
+    ''' Get handles registered for a function.
+
+    This is a dirty hack to add metadata to a function in a type-safe way.
+
+    Python takes advantage of the fact that function arguments cannot be
+    keywords to put the return annotation in the 'return' key.
+    We're doing the same with 'for'.
+
+    Think of it like, trigger this handler 'for' these events!
+    '''
+    return funct.__annotations__.get('for', [])
+
+
+def add_handle(funct: Callable, handle: Dict[str, Any]) -> None:
+    funct.__annotations__.setdefault('for', []).append(handle)
+
+
+def handles(**kwargs: Any) -> Callable[[Callable], Callable]:
+    '''Register a method as an event handler.
+
+    When applied to a method of `Client`, tagged methods will be registered
+    during class initialisation.
+    '''
+    def decorator(funct: Callable) -> Callable:
+        ''' Save the handles on the function object. '''
+        add_handle(funct, kwargs)
         return funct
     return decorator
-
-
-class WebsocketWrapper(WebSocketClient):
-    def __init__(self, client, *args, **kwargs):
-        self.client = client
-        super().__init__(*args, **kwargs)
-
-    def opened(self) -> None:
-        return self.client.opened()
-
-    def received_message(self, message: TextMessage) -> None:
-        return self.client.received_message(message)
-
-    def closed(self, code: str, reason: str = None) -> None:
-        return self.client.closed(code, reason)
 
 
 class Client:
@@ -119,31 +126,33 @@ class Client:
         self.handlers = []
         for method_name in dir(self):
             method = getattr(self, method_name)
-            if hasattr(method, 'handles'):
-                # TODO: validate type
+            if 'for' in getattr(method, '__annotations__', []):
                 self.register_handler(method)
 
         self.ws.connect()
 
-    def run(self):
+    def run(self) -> None:
         return self.ws.run_forever()
 
     # Websocket event handlers
     def opened(self) -> None:
+        ''' Called when the socket is opened. '''
         self.send_message(msg='connect', version='1', support=['1'])
 
     def received_message(self, message: TextMessage) -> None:
+        ''' Called when a message is received from the server.
+
+        This method deserialises the message and dispatches it to registered
+        event handlers.
+        '''
         event = json.loads(message.data, object_hook=Message.decoder)
 
         # Find all the handlers for this event
         handlers = [
             handler for handler in self.handlers
             if any(
-                all(
-                    key in event and event[key] == value
-                    for key, value in trigger.items()
-                )
-                for trigger in handler.handles
+                self._trigger_matches(trigger, event)
+                for trigger in get_handles(handler)
             )
         ]
 
@@ -154,9 +163,11 @@ class Client:
                 self.handlers.remove(handler)
 
     def closed(self, code: str, reason: str = None) -> None:
+        ''' Called when the socket is closed. '''
         pass
 
-    def close(self):
+    def close(self) -> None:
+        ''' Close the socket. '''
         self.ws.close()
 
     # Default event handlers
@@ -199,12 +210,16 @@ class Client:
                 self.subscribe('stream-room-messages', room['_id'])
 
     # Helpers for different types of messages
-    def send_message(self, **args) -> None:
+    def send_message(self, **args: Any) -> None:
         ''' Send a message to the server '''
         data = json.dumps(args)
         return self.ws.send(data)
 
-    def call(self, *args, callback=None, **kwargs) -> None:
+    def call(
+            self,
+            *args: Any,
+            callback: Listener = None,
+            **kwargs: Any) -> None:
         ''' Call a realtime API method.
 
         If a callback is specified, it is called with the response to this
@@ -221,14 +236,21 @@ class Client:
             self,
             name: str,
             event: str,
-            listener: Handler = None) -> None:
+            listener: Listener = None) -> None:
         ''' Subscribe to a stream.
 
         The optional parameter listener specifies a handler to call when
         corresponding messages are received.
+
+        If a listener is given, it is triggered by events with the matching
+        collection and event names.
         '''
         if listener:
-            self.register_handler(listener, collection=name)
+            self.register_handler(
+                listener,
+                collection=name,
+                fields={'eventName': event}
+            )
 
         return self.send_message(
             id=generate_id(),
@@ -245,14 +267,34 @@ class Client:
             "algorithm": "sha-256"
         }
 
-    def create_handler(self, callable) -> Handler:
-        if not inspect.isgeneratorfunction(callable):
-            return callable
+    @classmethod
+    def _trigger_matches(cls, trigger: Any, event: Any) -> bool:
+        if isinstance(trigger, dict):
+            for key, value in trigger.items():
+                try:
+                    if not cls._trigger_matches(value, event[key]):
+                        return False
+                except (KeyError, IndexError):
+                    return False
+            return True
+        elif isinstance(trigger, list):
+            for value in trigger:
+                if not cls._trigger_matches(value, event[key]):
+                    return False
+            return True
 
-        # If we have a generator function, let's wrap it.
-        def handler(message: Message):
-            # Grab the generator from the callable
-            generator = callable(message)
+        return trigger == event
+
+    def create_handler(self, listener: Listener) -> Handler:
+        def handler(message: Message) -> Optional[HandlerSignal]:
+            # Grab the generator from the listener
+            generator = listener(message)
+
+            # Function cases. We wrap to satisfy mypy :'(
+            if generator is None:
+                return None
+            elif isinstance(generator, HandlerSignal):
+                return generator
 
             try:
                 # Take the first value from the generator.
@@ -266,16 +308,31 @@ class Client:
                     # it's own object, we pass it to the result runner.
                     result.run(self, generator)
             return DONE
-        handler.handles = callable.handles
+        for handle in get_handles(listener):
+            add_handle(handler, handle)
         return handler
 
-    def register_handler(self, callable, **handles):
+    def register_handler(self, callable: Listener, **handles: Any) -> None:
         if handles:
-            if hasattr(callable, 'handles'):
-                callable.handles.append(handles)
-            else:
-                callable.handles = [handles]
+            add_handle(callable, handles)
         self.handlers.append(self.create_handler(callable))
+
+
+class WebsocketWrapper(WebSocketClient):
+    ''' Wrapper around WebSocketClient which proxies events to `client` '''
+
+    def __init__(self, client: Client, *args: Any, **kwargs: Any) -> None:
+        self.client = client
+        super().__init__(*args, **kwargs)
+
+    def opened(self) -> None:
+        return self.client.opened()
+
+    def received_message(self, message: TextMessage) -> None:
+        return self.client.received_message(message)
+
+    def closed(self, code: str, reason: str = None) -> None:
+        return self.client.closed(code, reason)
 
 
 class Runnable(ABC):
@@ -283,7 +340,7 @@ class Runnable(ABC):
     def run(self, client: Client, task: Task) -> None: ...
 
 
-class Call(Message):
+class Call(Message, Runnable):
     ''' A realtime API call message '''
 
     def __init__(self, method: str, *params, **args) -> None:
@@ -296,8 +353,10 @@ class Call(Message):
             params=params,
         )
 
-    def run(self, client: 'Client', task: Task) -> None:
-        def resume_task(message: Message):
+    def run(self, client: Client, task: Task) -> None:
+        ''' Sends the message, with `Task` registered as it's handler. '''
+        def resume_task(message: Message) -> HandlerSignal:
+            ''' Resume the given task. '''
             try:
                 result = task.send(message)
             except StopIteration:
@@ -307,6 +366,6 @@ class Call(Message):
                     result.run(client, task)
             return DONE
 
-        resume_task.handles = [{'id': self.id}]
+        add_handle(resume_task, {'id': self.id})
         client.register_handler(resume_task)
         client.send_message(**self)
