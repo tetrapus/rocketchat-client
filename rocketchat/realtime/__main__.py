@@ -6,7 +6,6 @@ from . import Client
 
 try:
     ws = Client(sys.argv[3], username=sys.argv[1], password=sys.argv[2])
-    ws.connect()
-    ws.run_forever()
+    ws.run()
 except KeyboardInterrupt:
     ws.close()
